@@ -14,6 +14,9 @@ import json
 import threading
 import webbrowser
 from datetime import datetime
+import queue
+import html2text
+from bs4 import BeautifulSoup
 
 
 class EmailClient:
@@ -43,6 +46,9 @@ class EmailClient:
         self.current_account = None
         self.load_accounts()
 
+        # 创建消息队列用于线程通信
+        self.message_queue = queue.Queue()
+
         # 创建UI
         self.create_ui()
 
@@ -51,6 +57,29 @@ class EmailClient:
             self.current_account = self.accounts[0]
             self.update_account_display()
             self.check_email()
+
+        # 启动消息处理线程
+        self.root.after(100, self.process_messages)
+
+    def process_messages(self):
+        """处理来自其他线程的消息"""
+        try:
+            while True:
+                message = self.message_queue.get_nowait()
+                if message[0] == "status":
+                    self.status_var.set(message[1])
+                elif message[0] == "error":
+                    messagebox.showerror("错误", message[1])
+                elif message[0] == "info":
+                    messagebox.showinfo("信息", message[1])
+                elif message[0] == "update_email_list":
+                    self.email_tree.delete(*self.email_tree.get_children())
+                    for email_data in message[1]:
+                        self.email_tree.insert("", tk.END, values=email_data[:3], iid=email_data[3])
+        except queue.Empty:
+            pass
+
+        self.root.after(100, self.process_messages)
 
     def create_ui(self):
         # 主框架
@@ -150,6 +179,15 @@ class EmailClient:
         self.delete_btn = ttk.Button(self.toolbar_frame, text="删除", command=self.delete_email)
         self.delete_btn.pack(side=tk.LEFT)
 
+        # 添加HTML/纯文本切换按钮
+        self.view_mode = tk.StringVar(value="plain")
+        self.html_view_btn = ttk.Radiobutton(self.toolbar_frame, text="HTML", variable=self.view_mode, value="html",
+                                             command=self.toggle_view_mode)
+        self.html_view_btn.pack(side=tk.RIGHT, padx=5)
+        self.plain_view_btn = ttk.Radiobutton(self.toolbar_frame, text="纯文本", variable=self.view_mode, value="plain",
+                                              command=self.toggle_view_mode)
+        self.plain_view_btn.pack(side=tk.RIGHT)
+
         # 状态栏
         self.status_var = tk.StringVar()
         self.status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN)
@@ -166,6 +204,28 @@ class EmailClient:
         )
         self.attachment_listbox.pack(fill=tk.X)
         self.attachment_listbox.bind("<Double-Button-1>", self.open_attachment)
+
+    def toggle_view_mode(self):
+        """切换HTML/纯文本视图"""
+        if hasattr(self, "current_email_html") and hasattr(self, "current_email_plain"):
+            if self.view_mode.get() == "html":
+                self.show_html_content()
+            else:
+                self.show_plain_content()
+
+    def show_html_content(self):
+        """显示HTML格式的邮件内容"""
+        self.email_content.config(state=tk.NORMAL)
+        self.email_content.delete(1.0, tk.END)
+        self.email_content.insert(tk.END, self.current_email_plain)  # 在实际应用中应该使用HTML渲染器
+        self.email_content.config(state=tk.DISABLED)
+
+    def show_plain_content(self):
+        """显示纯文本格式的邮件内容"""
+        self.email_content.config(state=tk.NORMAL)
+        self.email_content.delete(1.0, tk.END)
+        self.email_content.insert(tk.END, self.current_email_plain)
+        self.email_content.config(state=tk.DISABLED)
 
     def refresh_account_list(self):
         self.account_listbox.delete(0, tk.END)
@@ -193,7 +253,7 @@ class EmailClient:
 
     def update_account_display(self):
         if self.current_account:
-            self.root.title(f"BlueMail - {self.current_account['email']}")
+            self.root.title(f"Yanyn Email - {self.current_account['email']}")
             self.update_folder_list()
 
     def update_folder_list(self):
@@ -209,31 +269,34 @@ class EmailClient:
 
         # 如果是IMAP，可以获取服务器上的文件夹
         if self.current_account["protocol"] == "imap":
-            try:
-                self.status_var.set("正在连接服务器获取文件夹列表...")
-                self.root.update()
+            threading.Thread(target=self.fetch_imap_folders, daemon=True).start()
 
-                if self.current_account["ssl"]:
-                    mail = imaplib.IMAP4_SSL(self.current_account["incoming_server"],
-                                             int(self.current_account["incoming_port"]))
-                else:
-                    mail = imaplib.IMAP4(self.current_account["incoming_server"],
+    def fetch_imap_folders(self):
+        """在后台线程中获取IMAP文件夹"""
+        try:
+            self.message_queue.put(("status", "正在连接服务器获取文件夹列表..."))
+
+            if self.current_account["ssl"]:
+                mail = imaplib.IMAP4_SSL(self.current_account["incoming_server"],
                                          int(self.current_account["incoming_port"]))
+            else:
+                mail = imaplib.IMAP4(self.current_account["incoming_server"],
+                                     int(self.current_account["incoming_port"]))
 
-                mail.login(self.current_account["email"], self.current_account["password"])
-                status, folders = mail.list()
+            mail.login(self.current_account["email"], self.current_account["password"])
+            status, folders = mail.list()
 
-                if status == "OK":
-                    for folder_info in folders:
-                        folder_name = folder_info.decode().split('"/"')[-1].strip('"')
-                        if folder_name.lower() not in ["inbox", "sent", "drafts", "junk", "trash"]:
-                            self.folder_tree.insert("", tk.END, text=folder_name, values=(folder_name.lower(),))
+            if status == "OK":
+                for folder_info in folders:
+                    folder_name = folder_info.decode().split('"/"')[-1].strip('"')
+                    if folder_name.lower() not in ["inbox", "sent", "drafts", "junk", "trash"]:
+                        self.folder_tree.insert("", tk.END, text=folder_name, values=(folder_name.lower(),))
 
-                mail.logout()
-                self.status_var.set("文件夹列表已更新")
-            except Exception as e:
-                messagebox.showerror("错误", f"获取文件夹列表失败: {str(e)}")
-                self.status_var.set("获取文件夹列表失败")
+                self.message_queue.put(("status", "文件夹列表已更新"))
+            mail.logout()
+        except Exception as e:
+            self.message_queue.put(("error", f"获取文件夹列表失败: {str(e)}"))
+            self.message_queue.put(("status", "获取文件夹列表失败"))
 
     def on_folder_select(self, event):
         selection = self.folder_tree.selection()
@@ -249,21 +312,27 @@ class EmailClient:
         self.email_content.delete(1.0, tk.END)
         self.attachment_listbox.delete(0, tk.END)
 
-        self.status_var.set("正在检查邮件...")
-        self.root.update()
+        self.message_queue.put(("status", "正在检查邮件..."))
 
+        # 在新线程中检查邮件
+        threading.Thread(target=self._check_email_thread, args=(folder,), daemon=True).start()
+
+    def _check_email_thread(self, folder):
+        """在后台线程中检查邮件"""
         try:
             if self.current_account["protocol"] == "imap":
-                self.check_email_imap(folder)
+                emails = self.check_email_imap(folder)
             else:
-                self.check_email_pop3()
+                emails = self.check_email_pop3()
 
-            self.status_var.set("邮件检查完成")
+            self.message_queue.put(("update_email_list", emails))
+            self.message_queue.put(("status", "邮件检查完成"))
         except Exception as e:
-            messagebox.showerror("错误", f"检查邮件失败: {str(e)}")
-            self.status_var.set("检查邮件失败")
+            self.message_queue.put(("error", f"检查邮件失败: {str(e)}"))
+            self.message_queue.put(("status", "检查邮件失败"))
 
     def check_email_imap(self, folder="inbox"):
+        """IMAP协议检查邮件，返回邮件列表"""
         if self.current_account["ssl"]:
             mail = imaplib.IMAP4_SSL(self.current_account["incoming_server"],
                                      int(self.current_account["incoming_port"]))
@@ -292,6 +361,7 @@ class EmailClient:
             raise Exception("搜索邮件失败")
 
         message_ids = messages[0].split()
+        emails = []
 
         # 获取最新的50封邮件
         for msg_id in message_ids[-50:]:
@@ -314,11 +384,13 @@ class EmailClient:
             except:
                 date_str = date
 
-            self.email_tree.insert("", tk.END, values=(from_, subject, date_str), iid=msg_id.decode())
+            emails.append((from_, subject, date_str, msg_id.decode()))
 
         mail.logout()
+        return emails
 
     def check_email_pop3(self):
+        """POP3协议检查邮件，返回邮件列表"""
         if self.current_account["ssl"]:
             mail = poplib.POP3_SSL(self.current_account["incoming_server"], int(self.current_account["incoming_port"]))
         else:
@@ -329,6 +401,7 @@ class EmailClient:
 
         # 获取邮件数量和大小
         num_messages = len(mail.list()[1])
+        emails = []
 
         # 获取最新的20封邮件
         for i in range(max(1, num_messages - 19), num_messages + 1):
@@ -349,32 +422,44 @@ class EmailClient:
                 except:
                     date_str = date
 
-                self.email_tree.insert("", tk.END, values=(from_, subject, date_str), iid=str(i))
+                emails.append((from_, subject, date_str, str(i)))
             except:
                 continue
 
         mail.quit()
+        return emails
 
     def on_email_select(self, event):
         selection = self.email_tree.selection()
         if not selection:
             return
 
+        self.email_content.config(state=tk.NORMAL)
         self.email_content.delete(1.0, tk.END)
         self.attachment_listbox.delete(0, tk.END)
 
         msg_id = selection[0]
         self.current_email_id = msg_id
 
+        # 在新线程中加载邮件内容
+        threading.Thread(target=self._load_email_thread, args=(msg_id,), daemon=True).start()
+
+    def _load_email_thread(self, msg_id):
+        """在后台线程中加载邮件内容"""
         try:
             if self.current_account["protocol"] == "imap":
-                self.display_email_imap(msg_id)
+                email_message = self.fetch_email_imap(msg_id)
             else:
-                self.display_email_pop3(msg_id)
-        except Exception as e:
-            messagebox.showerror("错误", f"显示邮件失败: {str(e)}")
+                email_message = self.fetch_email_pop3(msg_id)
 
-    def display_email_imap(self, msg_id):
+            # 处理邮件内容
+            self.process_email_message(email_message)
+            self.message_queue.put(("status", "邮件加载完成"))
+        except Exception as e:
+            self.message_queue.put(("error", f"显示邮件失败: {str(e)}"))
+
+    def fetch_email_imap(self, msg_id):
+        """获取IMAP邮件内容"""
         if self.current_account["ssl"]:
             mail = imaplib.IMAP4_SSL(self.current_account["incoming_server"],
                                      int(self.current_account["incoming_port"]))
@@ -382,8 +467,6 @@ class EmailClient:
             mail = imaplib.IMAP4(self.current_account["incoming_server"], int(self.current_account["incoming_port"]))
 
         mail.login(self.current_account["email"], self.current_account["password"])
-
-        # 选择收件箱
         mail.select("inbox")
 
         # 获取邮件
@@ -394,11 +477,11 @@ class EmailClient:
         raw_email = msg_data[0][1]
         email_message = email.message_from_bytes(raw_email)
 
-        self.process_email_message(email_message)
-
         mail.logout()
+        return email_message
 
-    def display_email_pop3(self, msg_id):
+    def fetch_email_pop3(self, msg_id):
+        """获取POP3邮件内容"""
         if self.current_account["ssl"]:
             mail = poplib.POP3_SSL(self.current_account["incoming_server"], int(self.current_account["incoming_port"]))
         else:
@@ -412,11 +495,11 @@ class EmailClient:
         raw_email = b"\n".join(lines)
         email_message = email.message_from_bytes(raw_email)
 
-        self.process_email_message(email_message)
-
         mail.quit()
+        return email_message
 
     def process_email_message(self, email_message):
+        """处理邮件内容"""
         # 解析邮件头
         from_ = self.decode_header(email_message["From"])
         to = self.decode_header(email_message["To"])
@@ -424,14 +507,12 @@ class EmailClient:
         date = self.decode_header(email_message["Date"])
 
         # 显示邮件头
-        self.email_content.insert(tk.END, f"发件人: {from_}\n")
-        self.email_content.insert(tk.END, f"收件人: {to}\n")
-        self.email_content.insert(tk.END, f"主题: {subject}\n")
-        self.email_content.insert(tk.END, f"日期: {date}\n")
-        self.email_content.insert(tk.END, "\n" + "=" * 50 + "\n\n")
+        header_text = f"发件人: {from_}\n收件人: {to}\n主题: {subject}\n日期: {date}\n\n" + "=" * 50 + "\n\n"
 
         # 解析邮件内容
         self.current_email_attachments = []
+        plain_text = ""
+        html_text = ""
 
         if email_message.is_multipart():
             for part in email_message.walk():
@@ -448,15 +529,56 @@ class EmailClient:
                 # 邮件正文
                 elif content_type == "text/plain":
                     body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
-                    self.email_content.insert(tk.END, body)
+                    plain_text = body
                 elif content_type == "text/html":
                     body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
-                    # 简单显示HTML内容
-                    self.email_content.insert(tk.END, self.strip_html(body))
+                    html_text = body
+                    # 从HTML中提取纯文本
+                    if not plain_text:
+                        plain_text = self.html_to_plaintext(body)
         else:
-            body = email_message.get_payload(decode=True).decode(email_message.get_content_charset() or "utf-8",
-                                                                 errors="ignore")
-            self.email_content.insert(tk.END, body)
+            content_type = email_message.get_content_type()
+            body = email_message.get_payload(decode=True).decode(
+                email_message.get_content_charset() or "utf-8", errors="ignore")
+
+            if content_type == "text/plain":
+                plain_text = body
+            elif content_type == "text/html":
+                html_text = body
+                if not plain_text:
+                    plain_text = self.html_to_plaintext(body)
+            else:
+                plain_text = body
+
+        # 保存邮件内容
+        self.current_email_plain = header_text + plain_text
+        self.current_email_html = header_text + (html_text if html_text else plain_text)
+
+        # 显示邮件内容
+        self.email_content.delete(1.0, tk.END)
+        self.email_content.insert(tk.END, self.current_email_plain)
+        self.email_content.config(state=tk.DISABLED)
+
+    def html_to_plaintext(self, html):
+        """将HTML转换为纯文本"""
+        try:
+            # 使用BeautifulSoup提取文本
+            soup = BeautifulSoup(html, 'html.parser')
+            # 去除脚本和样式
+            for script in soup(["script", "style"]):
+                script.decompose()
+            # 获取文本
+            text = soup.get_text()
+            # 去除多余的空格和换行
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = '\n'.join(chunk for chunk in chunks if chunk)
+            return text
+        except:
+            # 如果解析失败，使用简单方法去除HTML标签
+            import re
+            clean = re.compile('<.*?>')
+            return re.sub(clean, '', html)
 
     def open_attachment(self, event):
         selection = self.attachment_listbox.curselection()
@@ -482,12 +604,6 @@ class EmailClient:
             os.startfile(filepath)
         except:
             messagebox.showinfo("打开附件", f"附件已保存到: {filepath}")
-
-    def strip_html(self, html):
-        # 简单的HTML标签去除
-        import re
-        clean = re.compile("<.*?>")
-        return re.sub(clean, "", html)
 
     def decode_header(self, header):
         if header is None:
@@ -523,11 +639,6 @@ class EmailClient:
         email_entry = ttk.Entry(form_frame, width=40)
         email_entry.grid(row=0, column=1, sticky=tk.W, pady=5)
 
-        # 显示名称
-        #ttk.Label(form_frame, text="显示名称:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        #name_entry = ttk.Entry(form_frame, width=40)
-        #name_entry.grid(row=1, column=1, sticky=tk.W, pady=5)
-
         # 密码
         ttk.Label(form_frame, text="密码:").grid(row=2, column=0, sticky=tk.W, pady=5)
         password_entry = ttk.Entry(form_frame, width=40, show="*")
@@ -538,8 +649,6 @@ class EmailClient:
         protocol_var = tk.StringVar(value="imap")
         protocol_imap = ttk.Radiobutton(form_frame, text="IMAP", variable=protocol_var, value="imap")
         protocol_imap.grid(row=3, column=1, sticky=tk.W, pady=5)
-        #protocol_pop3 = ttk.Radiobutton(form_frame, text="POP3", variable=protocol_var, value="pop3")
-        #protocol_pop3.grid(row=3, column=1, sticky=tk.E, pady=5)
 
         # 服务器设置框架
         server_frame = ttk.LabelFrame(form_frame, text="服务器设置")
@@ -611,7 +720,6 @@ class EmailClient:
                 outgoing_port_entry.delete(0, tk.END)
                 outgoing_port_entry.insert(0, "465")
                 outgoing_ssl_var.set(1)
-
             elif preset == "outlook":
                 incoming_server_entry.delete(0, tk.END)
                 incoming_server_entry.insert(0, "outlook.office365.com")
@@ -624,7 +732,6 @@ class EmailClient:
                 outgoing_port_entry.delete(0, tk.END)
                 outgoing_port_entry.insert(0, "587")
                 outgoing_ssl_var.set(1)
-
             elif preset == "yanyn":
                 incoming_server_entry.delete(0, tk.END)
                 incoming_server_entry.insert(0, "yanyn.cn")
@@ -656,7 +763,6 @@ class EmailClient:
         def save_account():
             account = {
                 "email": email_entry.get(),
-                #"name": name_entry.get(),
                 "password": password_entry.get(),
                 "protocol": protocol_var.get(),
                 "incoming_server": incoming_server_entry.get(),
@@ -813,24 +919,25 @@ class EmailClient:
         ttk.Button(button_frame, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=10)
 
     def delete_account(self):
-        if not self.current_account:
-            return
+        def delete_account(self):
+            if not self.current_account:
+                return
 
-        if messagebox.askyesno("确认", f"确定要删除账户 {self.current_account['email']} 吗？"):
-            self.accounts.remove(self.current_account)
-            self.save_accounts()
-            self.refresh_account_list()
+            if messagebox.askyesno("确认", f"确定要删除账户 {self.current_account['email']} 吗？"):
+                self.accounts.remove(self.current_account)
+                self.save_accounts()
+                self.refresh_account_list()
 
-            if self.accounts:
-                self.current_account = self.accounts[0]
-                self.update_account_display()
-            else:
-                self.current_account = None
-                self.root.title("BlueMail - Python邮件客户端")
-                self.folder_tree.delete(*self.folder_tree.get_children())
-                self.email_tree.delete(*self.email_tree.get_children())
-                self.email_content.delete(1.0, tk.END)
-                self.attachment_listbox.delete(0, tk.END)
+                if self.accounts:
+                    self.current_account = self.accounts[0]
+                    self.update_account_display()
+                else:
+                    self.current_account = None
+                    self.root.title("Yanyn Email")
+                    self.folder_tree.delete(*self.folder_tree.get_children())
+                    self.email_tree.delete(*self.email_tree.get_children())
+                    self.email_content.delete(1.0, tk.END)
+                    self.attachment_listbox.delete(0, tk.END)
 
     def show_compose_dialog(self, reply_to=None, forward_msg=None):
         if not self.current_account:
@@ -868,9 +975,16 @@ class EmailClient:
         subject_entry = ttk.Entry(form_frame, width=80)
         subject_entry.grid(row=3, column=1, sticky=tk.W, pady=5)
 
+        # 邮件格式选择
+        ttk.Label(form_frame, text="格式:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        format_var = tk.StringVar(value="plain")
+        ttk.Radiobutton(form_frame, text="纯文本", variable=format_var, value="plain").grid(row=4, column=1,
+                                                                                            sticky=tk.W)
+        ttk.Radiobutton(form_frame, text="HTML", variable=format_var, value="html").grid(row=4, column=1, sticky=tk.E)
+
         # 邮件内容
         content_text = tk.Text(form_frame, wrap=tk.WORD, height=20, width=80)
-        content_text.grid(row=4, column=0, columnspan=2, pady=10)
+        content_text.grid(row=5, column=0, columnspan=2, pady=10)
 
         # 如果是回复或转发，填充相应内容
         if reply_to:
@@ -904,7 +1018,7 @@ class EmailClient:
         # 附件列表
         self.compose_attachments = []
         attachment_frame = ttk.LabelFrame(form_frame, text="附件")
-        attachment_frame.grid(row=5, column=0, columnspan=2, sticky=tk.W + tk.E, pady=5)
+        attachment_frame.grid(row=6, column=0, columnspan=2, sticky=tk.W + tk.E, pady=5)
 
         self.attachment_list = tk.Listbox(attachment_frame, height=3, width=80)
         self.attachment_list.pack(fill=tk.X)
@@ -931,11 +1045,11 @@ class EmailClient:
 
         # 按钮框架
         button_frame = ttk.Frame(form_frame)
-        button_frame.grid(row=6, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=7, column=0, columnspan=2, pady=10)
 
         def send_email():
             # 创建邮件
-            msg = MIMEMultipart()
+            msg = MIMEMultipart('alternative')
             msg["From"] = f"{self.current_account.get('name', '')} <{self.current_account['email']}>"
             msg["To"] = to_entry.get()
             msg["Cc"] = cc_entry.get()
@@ -943,7 +1057,17 @@ class EmailClient:
 
             # 邮件正文
             body = content_text.get("1.0", tk.END)
-            msg.attach(MIMEText(body, "plain"))
+
+            if format_var.get() == "html":
+                # 创建HTML和纯文本版本
+                text_part = MIMEText(self.html_to_plaintext(body), "plain")
+                html_part = MIMEText(body, "html")
+
+                # 附加到邮件
+                msg.attach(text_part)
+                msg.attach(html_part)
+            else:
+                msg.attach(MIMEText(body, "plain"))
 
             # 添加附件
             for filename in self.compose_attachments:
@@ -958,30 +1082,12 @@ class EmailClient:
                 )
                 msg.attach(part)
 
-            # 发送邮件
-            try:
-                if self.current_account["outgoing_ssl"]:
-                    server = smtplib.SMTP_SSL(self.current_account["outgoing_server"],
-                                              int(self.current_account["outgoing_port"]))
-                else:
-                    server = smtplib.SMTP(self.current_account["outgoing_server"],
-                                          int(self.current_account["outgoing_port"]))
-
-                server.login(self.current_account["email"], self.current_account["password"])
-
-                recipients = [to_entry.get()]
-                if cc_entry.get():
-                    recipients.extend(cc_entry.get().split(","))
-                if bcc_entry.get():
-                    recipients.extend(bcc_entry.get().split(","))
-
-                server.sendmail(self.current_account["email"], recipients, msg.as_string())
-                server.quit()
-
-                messagebox.showinfo("成功", "邮件发送成功")
-                dialog.destroy()
-            except Exception as e:
-                messagebox.showerror("错误", f"发送邮件失败: {str(e)}")
+            # 在新线程中发送邮件
+            threading.Thread(
+                target=self._send_email_thread,
+                args=(msg, to_entry.get(), cc_entry.get(), bcc_entry.get()),
+                daemon=True
+            ).start()
 
         ttk.Button(button_frame, text="发送", command=send_email).pack(side=tk.LEFT, padx=10)
         ttk.Button(button_frame, text="保存草稿", command=lambda: self.save_draft(
@@ -993,6 +1099,31 @@ class EmailClient:
             self.compose_attachments
         )).pack(side=tk.LEFT, padx=10)
         ttk.Button(button_frame, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=10)
+
+    def _send_email_thread(self, msg, to, cc, bcc):
+        """在后台线程中发送邮件"""
+        try:
+            if self.current_account["outgoing_ssl"]:
+                server = smtplib.SMTP_SSL(self.current_account["outgoing_server"],
+                                          int(self.current_account["outgoing_port"]))
+            else:
+                server = smtplib.SMTP(self.current_account["outgoing_server"],
+                                      int(self.current_account["outgoing_port"]))
+
+            server.login(self.current_account["email"], self.current_account["password"])
+
+            recipients = [to]
+            if cc:
+                recipients.extend(cc.split(","))
+            if bcc:
+                recipients.extend(bcc.split(","))
+
+            server.sendmail(self.current_account["email"], recipients, msg.as_string())
+            server.quit()
+
+            self.message_queue.put(("info", "邮件发送成功"))
+        except Exception as e:
+            self.message_queue.put(("error", f"发送邮件失败: {str(e)}"))
 
     def save_draft(self, to, cc, bcc, subject, content, attachments):
         # 在实际应用中，这里应该将草稿保存到服务器的草稿箱
@@ -1045,16 +1176,21 @@ class EmailClient:
             return
 
         if messagebox.askyesno("确认", "确定要删除这封邮件吗？"):
-            try:
-                if self.current_account["protocol"] == "imap":
-                    self.delete_email_imap()
-                else:
-                    self.delete_email_pop3()
+        # 在新线程中删除邮件
+            threading.Thread(target=self._delete_email_thread, daemon=True).start()
 
-                messagebox.showinfo("成功", "邮件已删除")
-                self.check_email()
-            except Exception as e:
-                messagebox.showerror("错误", f"删除邮件失败: {str(e)}")
+    def _delete_email_thread(self):
+        """在后台线程中删除邮件"""
+        try:
+            if self.current_account["protocol"] == "imap":
+                self.delete_email_imap()
+            else:
+                self.delete_email_pop3()
+
+            self.message_queue.put(("info", "邮件已删除"))
+            self.check_email()
+        except Exception as e:
+            self.message_queue.put(("error", f"删除邮件失败: {str(e)}"))
 
     def delete_email_imap(self):
         if self.current_account["ssl"]:
