@@ -18,7 +18,6 @@ import queue
 import html2text
 from bs4 import BeautifulSoup
 
-
 class EmailClient:
     def __init__(self, root):
         self.root = root
